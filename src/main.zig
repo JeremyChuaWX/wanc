@@ -18,59 +18,55 @@ const CallbackData = struct {
 };
 
 fn paCallback(
-    inputBuffer: ?*const anyopaque,
-    outputBuffer: ?*anyopaque,
-    frameCount: c_ulong,
+    inputBuffer: ?*const anyopaque, // const void *input
+    outputBuffer: ?*anyopaque, // void *output
+    frameCount: c_ulong, // Number of frames for BOTH buffers
     timeInfo: ?*const pa.PaStreamCallbackTimeInfo,
     statusFlags: pa.PaStreamCallbackFlags,
     userData: ?*anyopaque, // Pointer to our CallbackData
 ) callconv(.C) c_int {
-    _ = outputBuffer;
-    _ = timeInfo;
+    _ = timeInfo; // Unused
 
     if (statusFlags & pa.paInputOverflow != 0) {
-        std.debug.print("Warning: Input overflow detected in callback!\n", .{});
+        std.debug.print("Warning: Input overflow detected!\n", .{});
     }
-    if (statusFlags & pa.paInputUnderflow != 0) {
-        std.debug.print("Warning: Input underflow detected in callback!\n", .{});
-    }
-
-    if (inputBuffer == null) {
-        std.debug.print("Warning: Null input buffer in callback!\n", .{});
-        return pa.paContinue;
+    if (statusFlags & pa.paOutputUnderflow != 0) {
+        std.debug.print("Warning: Output underflow detected!\n", .{});
     }
 
     if (userData == null) {
         std.debug.print("Error: userData is null in callback!\n", .{});
-        return pa.paAbort; // Cannot proceed without channel count
+        return pa.paAbort;
     }
     const data: *const CallbackData = @ptrCast(@alignCast(userData.?));
     const num_channels = data.channel_count;
 
-    const input_samples: [*c]const f32 = @ptrCast(@alignCast(inputBuffer.?));
-    const num_samples = frameCount * @as(c_ulong, @intCast(num_channels));
-
-    var peak: f32 = 0.0;
-    var sum_sq: f64 = 0.0;
-
-    var i: c_ulong = 0;
-    while (i < num_samples) : (i += 1) {
-        const sample = input_samples[i];
-        const abs_sample = @abs(sample);
-        if (abs_sample > peak) {
-            peak = abs_sample;
+    if (inputBuffer == null or outputBuffer == null) {
+        std.debug.print("Error: Null input or output buffer in callback!\n", .{});
+        // If output is null, fill it with silence? Or just abort? Abort seems safer.
+        // If input is null, we should probably output silence.
+        if (outputBuffer != null) {
+            // Fill output with silence if input is missing
+            const output_samples: [*c]f32 = @ptrCast(@alignCast(outputBuffer.?));
+            const num_samples_out = frameCount * @as(c_ulong, @intCast(num_channels));
+            const output_slice = std.mem.span(output_samples)[0..num_samples_out];
+            @memset(output_slice, 0.0);
+            std.debug.print("Input buffer null, outputting silence.\n", .{});
+            return pa.paContinue; // Continue outputting silence
+        } else {
+            return pa.paAbort; // Cannot proceed if output buffer is null
         }
-        sum_sq += @as(f64, sample) * @as(f64, sample);
     }
 
-    const rms = if (num_samples > 0)
-        std.math.sqrt(sum_sq / @as(f64, @floatFromInt(num_samples)))
-    else
-        0.0;
+    // Cast buffers to the correct sample type (paFloat32 -> f32)
+    const input_samples: [*c]const f32 = @ptrCast(@alignCast(inputBuffer.?));
+    const output_samples: [*c]f32 = @ptrCast(@alignCast(outputBuffer.?)); // Mutable!
 
-    std.debug.print("Callback: frames={d} peak={d:.4} RMS={d:.4}\n", .{
-        frameCount, peak, rms,
-    });
+    const num_samples_to_copy = frameCount * @as(c_ulong, @intCast(num_channels));
+
+    const input_slice = input_samples[0..num_samples_to_copy];
+    const output_slice = output_samples[0..num_samples_to_copy];
+    @memcpy(output_slice, input_slice);
 
     return pa.paContinue;
 }
@@ -80,7 +76,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     _ = allocator;
 
-    std.log.info("PortAudio Input Example (Callback - Device Defaults)", .{});
+    std.log.info("PortAudio Full-Duplex Example (Callback)", .{});
 
     var err: pa.PaError = undefined;
 
@@ -103,31 +99,45 @@ pub fn main() !void {
         std.log.err("No default input device found.", .{});
         return error.NoInputDevice;
     }
+    const outputDeviceIndex = pa.Pa_GetDefaultOutputDevice();
+    if (outputDeviceIndex == pa.paNoDevice) {
+        std.log.err("No default output device found.", .{});
+        return error.NoOutputDevice;
+    }
     std.log.info("Default Input Device Index: {d}", .{inputDeviceIndex});
+    std.log.info("Default Output Device Index: {d}", .{outputDeviceIndex});
 
-    const deviceInfo = pa.Pa_GetDeviceInfo(inputDeviceIndex);
-    if (deviceInfo == null) {
-        std.log.err("Could not get device info for index {d}", .{inputDeviceIndex});
+    const inputDeviceInfo = pa.Pa_GetDeviceInfo(inputDeviceIndex);
+    if (inputDeviceInfo == null) {
+        std.log.err("Could not get input device info (Index {d})", .{inputDeviceIndex});
         return error.DeviceInfoFailed;
     }
-    std.log.info("Using Device: {s}", .{std.mem.span(deviceInfo.*.name)});
+    const outputDeviceInfo = pa.Pa_GetDeviceInfo(outputDeviceIndex);
+    if (outputDeviceInfo == null) {
+        std.log.err("Could not get output device info (Index {d})", .{outputDeviceIndex});
+        return error.DeviceInfoFailed;
+    }
+    std.log.info("Input Device: {s}", .{std.mem.span(inputDeviceInfo.*.name)});
+    std.log.info("Output Device: {s}", .{std.mem.span(outputDeviceInfo.*.name)});
 
-    const sample_rate: f64 = deviceInfo.*.defaultSampleRate;
-    const max_input_channels: c_int = deviceInfo.*.maxInputChannels;
+    const sample_rate: f64 = inputDeviceInfo.*.defaultSampleRate;
 
-    if (max_input_channels == 0) {
-        std.log.err("Selected device '{s}' has no input channels.", .{
-            std.mem.span(deviceInfo.*.name),
-        });
+    // Use mono (1 channel) if supported by both, otherwise fail.
+    // Could add logic for stereo if needed.
+    if (inputDeviceInfo.*.maxInputChannels == 0) {
+        std.log.err("Input device has no input channels.", .{});
         return error.NoInputChannelsOnDevice;
     }
-    const num_channels: c_int = 1; // Use mono if possible
+    if (outputDeviceInfo.*.maxOutputChannels == 0) {
+        std.log.err("Output device has no output channels.", .{});
+        return error.NoOutputChannelsOnDevice;
+    }
+    const num_channels: c_int = 1; // Use mono
 
-    // Let PortAudio determine the optimal buffer size based on latency.
     const frames_per_buffer: c_ulong = pa.paFramesPerBufferUnspecified;
 
     std.log.info(
-        \\Using Device Defaults: Sample Rate={d:.1}, Channels={d}, FramesPerBuffer=Unspecified
+        \\Using Parameters: Sample Rate={d:.1}, Channels={d}, FramesPerBuffer=Unspecified
     , .{ sample_rate, num_channels });
 
     var callback_data = CallbackData{
@@ -136,20 +146,37 @@ pub fn main() !void {
 
     var inputParameters: pa.PaStreamParameters = .{
         .device = inputDeviceIndex,
-        .channelCount = num_channels, // Use determined channel count
-        .sampleFormat = SAMPLE_FORMAT, // Use configured format
-        .suggestedLatency = deviceInfo.*.defaultLowInputLatency, // Use device low latency
+        .channelCount = num_channels,
+        .sampleFormat = SAMPLE_FORMAT,
+        .suggestedLatency = inputDeviceInfo.*.defaultLowInputLatency,
         .hostApiSpecificStreamInfo = null,
     };
 
+    var outputParameters: pa.PaStreamParameters = .{
+        .device = outputDeviceIndex,
+        .channelCount = num_channels,
+        .sampleFormat = SAMPLE_FORMAT,
+        .suggestedLatency = outputDeviceInfo.*.defaultLowOutputLatency,
+        .hostApiSpecificStreamInfo = null,
+    };
+
+    err = pa.Pa_IsFormatSupported(&inputParameters, &outputParameters, sample_rate);
+    if (err != pa.paFormatIsSupported) {
+        printPaError("Pa_IsFormatSupported", err);
+        std.log.err("The requested format combination is not supported.", .{});
+        return error.FormatNotSupported;
+    } else {
+        std.log.info("Format combination is supported.", .{});
+    }
+
     var stream: ?*pa.PaStream = null;
-    std.log.info("Opening stream...", .{});
+    std.log.info("Opening full-duplex stream...", .{});
     err = pa.Pa_OpenStream(
         &stream,
-        &inputParameters,
-        null, // No output
-        sample_rate, // Use determined sample rate
-        frames_per_buffer, // Use paFramesPerBufferUnspecified
+        &inputParameters, // Pointer to input parameters
+        &outputParameters, // Pointer to output parameters
+        sample_rate,
+        frames_per_buffer,
         pa.paNoFlag,
         paCallback,
         &callback_data, // Pass pointer to our data struct
@@ -170,8 +197,12 @@ pub fn main() !void {
 
     const streamInfo = pa.Pa_GetStreamInfo(stream);
     if (streamInfo != null) {
-        std.log.info("Actual Stream Info: Latency={d:.4}s, SampleRate={d:.1}Hz", .{
-            streamInfo.*.inputLatency, streamInfo.*.sampleRate,
+        std.log.info(
+            \\Actual Stream Info: Input Latency={d:.4}s, Output Latency={d:.4}s, SampleRate={d:.1}Hz
+        , .{
+            streamInfo.*.inputLatency,
+            streamInfo.*.outputLatency,
+            streamInfo.*.sampleRate,
         });
     }
 
@@ -191,10 +222,10 @@ pub fn main() !void {
         }
     }
 
-    std.log.info("Stream is active. Listening for 10 seconds...", .{});
-    std.log.info("Check your console for 'Callback:' messages.", .{});
-    pa.Pa_Sleep(1000); // Sleep for 1s (Pa_Sleep takes milliseconds)
-    std.log.info("Finished listening.", .{});
+    std.log.info("Stream is active. Playing back input for 10 seconds...", .{});
+    std.log.info("You should hear audio from your input device now.", .{});
+    pa.Pa_Sleep(10 * 1000);
+    std.log.info("Finished playback.", .{});
 
     std.log.info("Exiting normally.", .{});
 }
