@@ -13,46 +13,45 @@ fn printPaError(comptime context: []const u8, err_code: pa.PaError) void {
     });
 }
 
-// This function is called by PortAudio in a high-priority thread.
-// Keep it fast! Avoid allocations, file I/O, or complex locking.
-fn paCallback(
-    inputBuffer: ?*const anyopaque, // const void *input
-    outputBuffer: ?*anyopaque, // void *output (unused for input-only)
-    frameCount: c_ulong, // Number of frames in this buffer
-    timeInfo: ?*const pa.PaStreamCallbackTimeInfo, // Timing info (unused here)
-    statusFlags: pa.PaStreamCallbackFlags, // e.g., paInputOverflow
-    userData: ?*anyopaque, // Custom data pointer (unused here)
-) callconv(.C) c_int { // IMPORTANT: Must use C calling convention
-    _ = outputBuffer; // Mark as unused
-    _ = timeInfo;
-    _ = userData;
+const CallbackData = struct {
+    channel_count: c_int,
+};
 
-    // Check for input buffer issues reported by PortAudio
+fn paCallback(
+    inputBuffer: ?*const anyopaque,
+    outputBuffer: ?*anyopaque,
+    frameCount: c_ulong,
+    timeInfo: ?*const pa.PaStreamCallbackTimeInfo,
+    statusFlags: pa.PaStreamCallbackFlags,
+    userData: ?*anyopaque, // Pointer to our CallbackData
+) callconv(.C) c_int {
+    _ = outputBuffer;
+    _ = timeInfo;
+
     if (statusFlags & pa.paInputOverflow != 0) {
-        // Using std.debug.print is often safer in callbacks than std.log
         std.debug.print("Warning: Input overflow detected in callback!\n", .{});
     }
     if (statusFlags & pa.paInputUnderflow != 0) {
         std.debug.print("Warning: Input underflow detected in callback!\n", .{});
     }
 
-    // Ensure we actually have an input buffer
     if (inputBuffer == null) {
         std.debug.print("Warning: Null input buffer in callback!\n", .{});
-        // Returning paContinue might be okay, but paAbort might be safer
-        // if this indicates a serious problem. Let's continue for now.
         return pa.paContinue;
     }
 
-    // Cast the opaque input pointer to the correct sample type (paFloat32 -> f32)
-    // The buffer contains 'frameCount * NUM_CHANNELS' samples.
-    // Using @alignCast is good practice when casting from anyopaque.
-    const input_samples: [*c]const f32 = @ptrCast(@alignCast(inputBuffer.?));
-    const num_samples = frameCount * @as(c_ulong, @intCast(NUM_CHANNELS));
+    if (userData == null) {
+        std.debug.print("Error: userData is null in callback!\n", .{});
+        return pa.paAbort; // Cannot proceed without channel count
+    }
+    const data: *const CallbackData = @ptrCast(@alignCast(userData.?));
+    const num_channels = data.channel_count;
 
-    // --- Process the audio data (Example: Calculate Peak and RMS) ---
+    const input_samples: [*c]const f32 = @ptrCast(@alignCast(inputBuffer.?));
+    const num_samples = frameCount * @as(c_ulong, @intCast(num_channels));
+
     var peak: f32 = 0.0;
-    var sum_sq: f64 = 0.0; // Use f64 for accumulator to avoid precision loss
+    var sum_sq: f64 = 0.0;
 
     var i: c_ulong = 0;
     while (i < num_samples) : (i += 1) {
@@ -69,25 +68,19 @@ fn paCallback(
     else
         0.0;
 
-    // Print the results (again, std.debug.print is preferred in callback)
-    // Limit printing frequency in real apps if performance is critical
     std.debug.print("Callback: frames={d} peak={d:.4} RMS={d:.4}\n", .{
         frameCount, peak, rms,
     });
 
-    // Tell PortAudio to keep calling this callback
     return pa.paContinue;
 }
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    _ = allocator; // Mark as used if needed later, unused in this example
+    _ = allocator;
 
-    std.log.info("PortAudio Input Example (Callback)", .{});
-    std.log.info("Sample Rate: {d}, Channels: {d}, Format: paFloat32", .{
-        SAMPLE_RATE, NUM_CHANNELS,
-    });
+    std.log.info("PortAudio Input Example (Callback - Device Defaults)", .{});
 
     var err: pa.PaError = undefined;
 
@@ -116,39 +109,50 @@ pub fn main() !void {
     if (deviceInfo == null) {
         std.log.err("Could not get device info for index {d}", .{inputDeviceIndex});
         return error.DeviceInfoFailed;
-    } else {
-        std.log.info("Using Device: {s}", .{std.mem.span(deviceInfo.*.name)});
-        std.log.info("Max Input Channels: {d}", .{deviceInfo.*.maxInputChannels});
-        if (NUM_CHANNELS > deviceInfo.*.maxInputChannels) {
-            std.log.err("Requested channel count ({d}) exceeds device max ({d})", .{
-                NUM_CHANNELS, deviceInfo.*.maxInputChannels,
-            });
-            return error.InvalidChannelCount;
-        }
     }
+    std.log.info("Using Device: {s}", .{std.mem.span(deviceInfo.*.name)});
+
+    const sample_rate: f64 = deviceInfo.*.defaultSampleRate;
+    const max_input_channels: c_int = deviceInfo.*.maxInputChannels;
+
+    if (max_input_channels == 0) {
+        std.log.err("Selected device '{s}' has no input channels.", .{
+            std.mem.span(deviceInfo.*.name),
+        });
+        return error.NoInputChannelsOnDevice;
+    }
+    const num_channels: c_int = 1; // Use mono if possible
+
+    // Let PortAudio determine the optimal buffer size based on latency.
+    const frames_per_buffer: c_ulong = pa.paFramesPerBufferUnspecified;
+
+    std.log.info(
+        \\Using Device Defaults: Sample Rate={d:.1}, Channels={d}, FramesPerBuffer=Unspecified
+    , .{ sample_rate, num_channels });
+
+    var callback_data = CallbackData{
+        .channel_count = num_channels,
+    };
 
     var inputParameters: pa.PaStreamParameters = .{
         .device = inputDeviceIndex,
-        .channelCount = NUM_CHANNELS,
-        .sampleFormat = SAMPLE_FORMAT,
-        .suggestedLatency = if (deviceInfo != null)
-            deviceInfo.*.defaultLowInputLatency
-        else
-            0.0,
-        .hostApiSpecificStreamInfo = null, // Usually null
+        .channelCount = num_channels, // Use determined channel count
+        .sampleFormat = SAMPLE_FORMAT, // Use configured format
+        .suggestedLatency = deviceInfo.*.defaultLowInputLatency, // Use device low latency
+        .hostApiSpecificStreamInfo = null,
     };
 
-    var stream: ?*pa.PaStream = null; // Pointer to the stream object
+    var stream: ?*pa.PaStream = null;
     std.log.info("Opening stream...", .{});
     err = pa.Pa_OpenStream(
-        &stream, // Address of the stream pointer
-        &inputParameters, // Pointer to input parameters
-        null, // No output parameters
-        SAMPLE_RATE,
-        FRAMES_PER_BUFFER,
-        pa.paNoFlag, // No special stream flags
-        paCallback, // Pointer to OUR callback function
-        null, // No user data pointer needed for this example
+        &stream,
+        &inputParameters,
+        null, // No output
+        sample_rate, // Use determined sample rate
+        frames_per_buffer, // Use paFramesPerBufferUnspecified
+        pa.paNoFlag,
+        paCallback,
+        &callback_data, // Pass pointer to our data struct
     );
     if (err != pa.paNoError) {
         printPaError("Pa_OpenStream", err);
@@ -164,6 +168,13 @@ pub fn main() !void {
         }
     }
 
+    const streamInfo = pa.Pa_GetStreamInfo(stream);
+    if (streamInfo != null) {
+        std.log.info("Actual Stream Info: Latency={d:.4}s, SampleRate={d:.1}Hz", .{
+            streamInfo.*.inputLatency, streamInfo.*.sampleRate,
+        });
+    }
+
     std.log.info("Starting stream...", .{});
     err = pa.Pa_StartStream(stream);
     if (err != pa.paNoError) {
@@ -173,7 +184,6 @@ pub fn main() !void {
     defer {
         if (stream != null) {
             std.log.info("Stopping stream...", .{});
-            // Use Abort for quicker exit, Stop waits for buffers.
             const stop_err = pa.Pa_AbortStream(stream);
             if (stop_err != pa.paNoError) {
                 printPaError("Pa_AbortStream", stop_err);
