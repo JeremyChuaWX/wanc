@@ -25,7 +25,7 @@ fn paCallback(
     statusFlags: pa.PaStreamCallbackFlags,
     userData: ?*anyopaque, // Pointer to our CallbackData
 ) callconv(.C) c_int {
-    _ = timeInfo; // Unused
+    _ = timeInfo;
 
     if (statusFlags & pa.paInputOverflow != 0) {
         std.debug.print("Warning: Input overflow detected!\n", .{});
@@ -43,8 +43,6 @@ fn paCallback(
 
     if (inputBuffer == null or outputBuffer == null) {
         std.debug.print("Error: Null input or output buffer in callback!\n", .{});
-        // If output is null, fill it with silence? Or just abort? Abort seems safer.
-        // If input is null, we should probably output silence.
         if (outputBuffer != null) {
             // Fill output with silence if input is missing
             const output_samples: [*c]f32 = @ptrCast(@alignCast(outputBuffer.?));
@@ -58,9 +56,8 @@ fn paCallback(
         }
     }
 
-    // Cast buffers to the correct sample type (paFloat32 -> f32)
     const input_samples: [*c]const f32 = @ptrCast(@alignCast(inputBuffer.?));
-    const output_samples: [*c]f32 = @ptrCast(@alignCast(outputBuffer.?)); // Mutable!
+    const output_samples: [*c]f32 = @ptrCast(@alignCast(outputBuffer.?)); // mutable
 
     const num_samples_to_copy = frameCount * @as(c_ulong, @intCast(num_channels));
 
