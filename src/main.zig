@@ -41,29 +41,27 @@ fn paCallback(
     const data: *const CallbackData = @ptrCast(@alignCast(userData.?));
     const num_channels = data.channel_count;
 
-    if (inputBuffer == null or outputBuffer == null) {
-        std.debug.print("Error: Null input or output buffer in callback!\n", .{});
-        if (outputBuffer != null) {
-            // Fill output with silence if input is missing
-            const output_samples: [*c]f32 = @ptrCast(@alignCast(outputBuffer.?));
-            const num_samples_out = frameCount * @as(c_ulong, @intCast(num_channels));
-            const output_slice = std.mem.span(output_samples)[0..num_samples_out];
-            @memset(output_slice, 0.0);
-            std.debug.print("Input buffer null, outputting silence.\n", .{});
-            return pa.paContinue; // Continue outputting silence
-        } else {
-            return pa.paAbort; // Cannot proceed if output buffer is null
-        }
+    if (outputBuffer == null) {
+        std.debug.print("Error: Null output buffer in callback!\n", .{});
+        return pa.paAbort;
+    }
+
+    const output_samples: [*c]f32 = @ptrCast(@alignCast(outputBuffer.?)); // mutable
+    const num_samples_total = frameCount * @as(c_ulong, @intCast(num_channels));
+    const output_slice = output_samples[0..num_samples_total];
+
+    if (inputBuffer == null) {
+        std.debug.print("Input buffer null, outputting silence.\n", .{});
+        @memset(output_slice, 0.0);
+        return pa.paContinue;
     }
 
     const input_samples: [*c]const f32 = @ptrCast(@alignCast(inputBuffer.?));
-    const output_samples: [*c]f32 = @ptrCast(@alignCast(outputBuffer.?)); // mutable
+    const input_slice = input_samples[0..num_samples_total];
 
-    const num_samples_to_copy = frameCount * @as(c_ulong, @intCast(num_channels));
-
-    const input_slice = input_samples[0..num_samples_to_copy];
-    const output_slice = output_samples[0..num_samples_to_copy];
-    @memcpy(output_slice, input_slice);
+    for (input_slice, 0..) |input_sample, i| {
+        output_slice[i] = -input_sample;
+    }
 
     return pa.paContinue;
 }
